@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import rff
 from bitEstimator import BitEstimator
 
 class custom_linear(nn.Module):
