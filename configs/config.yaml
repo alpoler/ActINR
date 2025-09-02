@@ -1,0 +1,65 @@
+# folding
+ksize: [360, 480]
+stride: [360, 480]
+group_size: [27,48]
+entropy_group: [3,4]
+h: 3840
+w: 2160
+
+# network
+in_features: 2
+out_features: 3
+nfeat: 48
+nlayers: 2
+omega_0: 5
+scale: 10
+nonlin: 'wire_time'     
+nonlin_type: 'orig'
+mode: "2d"
+share_weights: False
+slowmo: False
+start: 
+end:
+inpainting: inpainting_fixed_50
+prune: True
+prune_ratio: 0.85
+qat: False
+eval_fps: False
+quant: False
+
+# training
+lr: 5.e-3
+epochs: 2000
+loss: 'mse'
+switch_thres: 2.e-7
+coordstype: 'local' 
+weightshare: 'share'
+propmethod: 'coarse2fine'
+maxchunks: 16384
+inference: False
+smoothing: False
+prune_epoch: 2000 
+qat_epoch: 2000
+
+slowmo: False
+pos_encode: False
+
+# warm starting
+warm_start: False
+warm_epochs: 100
+
+#Dataset Related
+freq: 2
+resize: -1
+bs: 2
+partition_size: 
+path: './dataset.txt'
+n_frames: 13
+dataset_name: dataset
+pretrained_path: None
+save_path: "./dataset"
+model_type: "kilonerf"
+optim_type: "multibias"
+exp_name: "dataset"
+hyper_scale: 2
+quant_model_bit: 8
