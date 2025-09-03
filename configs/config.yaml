@@ -54,7 +54,7 @@ resize: -1
 bs: 2
 partition_size: 
 path: './dataset.txt'
-n_frames: 13
+n_frames: 
 dataset_name: dataset
 pretrained_path: None
 save_path: "./dataset"
