@@ -3,7 +3,6 @@
 import os
 import sys
 from numpy.lib.twodim_base import mask_indices
-from modules.quantize import quant_model
 import tqdm
 import importlib
 import time
@@ -20,13 +19,11 @@ from distr_sampler import MyDistributedSampler
 from pytorch_msssim import ms_ssim
 import cv2
 import torch
-import torch.nn.utils.prune as prune
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.nn import Parameter
-from dataset_class import VideoDataset, BalancedSampler, DistributedSamplerWrapper
+from modules.dataset_class import VideoDataset, BalancedSampler, DistributedSamplerWrapper
 import folding_utils as unfoldNd
 import torch.nn.functional as F
-from dahuffman import HuffmanCodec
 
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -34,47 +31,21 @@ import matplotlib.pyplot as plt
 plt.gray()
 
 import utils
-import siren_time
+import siren
 import losses
 import volutils
 import wire
 import models
 
 utils = importlib.reload(utils)
-siren = importlib.reload(siren_time)
+siren = importlib.reload(siren)
 losses = importlib.reload(losses)
 volutils = importlib.reload(volutils)
 wire = importlib.reload(wire)
 models = importlib.reload(models)
-#from distr_sampler import MyDistributedSampler
+# from distr_sampler import MyDistributedSampler
 from torch.utils.data.distributed import DistributedSampler
 
-
-class qfn(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, input, k):
-        
-        if input.dtype==torch.cfloat:
-            n = float(2**(k-1) - 1)
-            input = torch.view_as_real(input)
-            max_w = torch.max(torch.abs(input)).detach()
-            input = input / 2 / max_w + 0.5
-            input = torch.round(input * n) / n
-            out = max_w * (2 * input - 1)
-            out = torch.view_as_complex(out)
-        else:
-            n = float(2**(k-1) - 1)
-            max_w = torch.max(torch.abs(input)).detach()
-            input = input / 2 / max_w + 0.5
-            input = torch.round(input * n) / n
-            out = max_w * (2 * input - 1)
-
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        grad_input = grad_output.clone()
-        return grad_input, None
 
 
 
@@ -99,12 +70,14 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
             model: Trained model
     '''
     save_path = os.path.join(config.save_path, config.dataset_name, config.model_type+'_'+str(config.nfeat).zfill(2))
+    
     #device = torch.device("cuda:{.d}".format(rank))
     if sys.platform == 'win32':
         visualize = True
     else:
         visualize = False
     # Dataset Preparation
+    print(config.resize)
     if config.resize != -1:
         H,W = config.resize
     else:
@@ -112,10 +85,17 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
         #H,W = 960,1920
         #H,W = 480,480
 
+    fold = torch.nn.Fold(output_size=(H, W),
+                         kernel_size=config.ksize,
+                         stride=config.stride)
+
     unfold = torch.nn.Unfold(kernel_size=config.ksize, stride=config.stride)
+    # Find out number of chunks
+    weighing = torch.ones(1,1,H,W)
+    nchunks = unfold(weighing).shape[-1] 
     if not config.inference:
         train_dataset = VideoDataset(config.path,config.freq, config.n_frames,
-                                 True,config.partition_size, config.resize, unfold=unfold,start=config.start,end=config.end,config=config)
+                                 True,config.partition_size, config.resize, unfold=unfold,start=config.start,end=config.end,config=config,nchunks=nchunks)
         
         train_sampler = DistributedSampler(train_dataset,num_replicas=world_size,rank=rank,shuffle=True)
     
@@ -128,29 +108,42 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
     
     if config.freq == 1:
         test_dataset = VideoDataset(config.path,config.freq, config.n_frames,
-                            True,config.partition_size, config.resize,unfold=unfold,start=config.start,end=config.end,config=config)
+                            True,config.partition_size, config.resize,unfold=unfold,start=config.start,end=config.end,config=config,nchunks=nchunks)
         
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                 num_workers=0, pin_memory=True, sampler=None, drop_last=False)
 
     else:
         test_dataset = VideoDataset(config.path,config.freq, config.n_frames,
-                                    False,config.partition_size, config.resize,unfold=unfold,start=config.start,end=config.end,config=config)
+                                    False,config.partition_size, config.resize,unfold=unfold,start=config.start,end=config.end,config=config,nchunks=nchunks)
         
         test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False,
                 num_workers=0, pin_memory=False, sampler=None, drop_last=False)
 
 
 
-    H = test_dataset.h_max+1
-    W = test_dataset.w_max+1
+    #H = test_dataset.h_max+1
+    #W = test_dataset.w_max+1
+    # H=1
+    # test_dataset.h_max =1 
+    # test_dataset.w_max = 300
+    # W=300
+    # nchunks=1
+    #nchunks= test_dataset.nchunks
 
-    nchunks= test_dataset.nchunks
+
+    # Create folders and unfolders
+
+
 
     
-    fold = torch.nn.Fold(output_size=(H, W),
-                         kernel_size=config.ksize,
-                         stride=config.stride)
+
+    #window_weights = get_bilinear(H,W,config.ksize,config.stride)
+    #window_weights = window_weights.cuda(rank)
+    
+
+
+
 
     config.no_tiles = test_dataset.no_tiles
     print(config.no_tiles)
@@ -174,35 +167,29 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
             print(nparams_array[idx]/1e6)
 
         if pretrained_models is not None:
-            if config.inference:
-                new_state_dict = {key.replace("module.",""): value for key, value in pretrained_models[idx].items()}
-                pretrained_models[idx].clear()
-                pretrained_models[idx].update(new_state_dict)
+            new_state_dict = {key.replace('module.', ''): value for key, value in pretrained_models[idx].items()}
+            pretrained_models[idx].clear()
+            pretrained_models[idx].update(new_state_dict)
             model.load_state_dict(pretrained_models[idx])
             
         model_list.append(model)
-
-
-    param_groups=[]
-    for name,params in model.named_parameters():
-        if name.endswith("weight"):
-            param_groups+=[{"params": [params],"lr": config.lr,"name":name}]
-        elif name.endswith("scale"):
-            param_groups+=[{"params": [params],"lr": config.lr,"name":name}]
-        elif name.endswith("shift"):
-            param_groups+=[{"params": [params],"lr": config.lr,"name":name}]
-        
-    param_groups += [{"params": [p for n,p in model.named_parameters() if n.endswith("bias")],
-                     "lr": config.lr,"name": "biases"}]
-    optim = torch.optim.Adam(param_groups)
-    prob_models=[{"params": [p for n,p in model.named_parameters() if "cdf" in n],"lr": config.prob_lr,"name": "prob_params"}]
-    prob_optim = torch.optim.Adam(prob_models)
     
+    #hyper_parameters = [param for name, param in model.named_parameters() if 'hyper' in name]
+    #other_parameters = [param for name, param in model.named_parameters() if 'hyper' not in name]
+    #train_dataset.edge_init(model)
+    #from optimizer import Adan
+    #optim = Adan(params=params,lr=config.lr)
+    # optim = torch.optim.Adam([
+    # {'params': hyper_parameters, 'lr': 1e-3},  # Learning rate for 'hyper' parameters
+    # {'params': other_parameters, 'lr': 5e-3}])   # Learning rate for other parameters
+
+    optim = torch.optim.Adam(lr=config.lr, params=params)
         
     # Criteria
     criterion = losses.L2Norm()
 
 
+    
     # Create inputs
     coords_chunked = utils.get_coords((H,W),
                                      config.ksize,
@@ -217,35 +204,38 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
     best_img = None
     master = (rank == 0)
     learn_indices = torch.arange(nchunks).cuda(rank)
-    total_params = sum([p.data.nelement() for p in model.parameters()]) / 1e6
+
     tbar = tqdm.tqdm(range(config.epochs),disable = not master)
 
     if not config.inference:
-
         for idx in tbar:
-            lr = config.lr*pow(0.1, idx/config.epochs)
-            optim.param_groups[0]['lr'] = lr
+            if master:
+                lr = config.lr*pow(0.1, idx/config.epochs)
+                #lr2 = 5e-3*pow(0.1, idx/config.epochs)
+                optim.param_groups[0]['lr'] = lr
+                #optim.param_groups[1]['lr'] = lr2
             train_sampler.set_epoch(idx)
             psnr_list = []
-
-
-                        
-            if idx % 10 == 0:
-                model.module.set_divider()
-            
+            idx_list = []
+            idx_list1= []
+            #indices_t = torch.randperm(nimg)
             for sample in train_loader: 
                 t_coords = sample["t"].cuda(rank).permute(1,0,2)
                 imten = sample["img"].cuda(rank)
                 model_idx = sample["model_idx"].cuda(rank)
+                #grad_map = sample["grad_map"].cuda(rank)
                 t_coords = (t_coords,model_idx)
                 
+                # if rank == 0:
+                #     idx_list.append(sample["data_idx"])
+                # else:
+                #     idx_list1.append(sample["data_idx"])
                 optim.zero_grad()
-                prob_optim.zero_grad()
+                
 
-                entr_loss, bits = model.module.calculate_bit_per_parameter()
-                im_out = model(coords_chunked, learn_indices,t_coords,epochs=idx)
+                im_out = model(coords_chunked, learn_indices,t_coords)
                 im_out = im_out.permute(0, 3, 2, 1).reshape(-1,config.out_features,config.ksize[0],config.ksize[1],nchunks)
-                #im_out = im_out#*window_weights
+                im_out = im_out#*window_weights
                 im_out = im_out.reshape(-1,config.out_features*config.ksize[0]*config.ksize[1],nchunks)
                 im_estim = fold(im_out).reshape(-1, config.out_features, H, W)
                 
@@ -253,67 +243,61 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
                     im_estim = fold(im_out).reshape(1, -1, H, W)
                     loss = criterion(im_estim, imten[0,...])
                 else:
-                    loss=criterion(im_estim, imten)
-                    total_loss = loss + config.lambda_rate*entr_loss
+                    loss=criterion(im_estim, imten)#*grad_map[:,None,...]
                 
 
 
-                total_loss.backward()
+                loss.backward()
                 optim.step()
-                prob_optim.step()
                 with torch.no_grad():
-                    bpp = bits / (H*W*config.n_frames)
                     lossval = loss.item()
                     psnr_list.append(-10*math.log10(lossval))
 
                 
             avg_psnr = sum(psnr_list) / len(psnr_list)
             if rank == 0:
-                tbar.set_description(('%.3f %.3f')%(avg_psnr,bpp))
+                tbar.set_description(('%.3f')%(avg_psnr))
                 tbar.refresh()
     
 
     if rank==0:
-
+        error_test = []
+        rec_test = []
+        mssim_list = []
         # Test for intermediate coordinates 
-        pred_videos = []
-
         with torch.no_grad():
-
-            error_test = []
-            rec_test = []
-            mssim_list = []
-            time_list= []
+            
+            #indices_t = torch.arange(0,nimg_test)  
             for sample in test_loader: 
                 t_coords = sample["t"].cuda(rank).permute(1,0,2)
                 imten = sample["img"].cuda(rank)
                 model_idx = sample["model_idx"].cuda(rank)
                 t_coords = (t_coords,model_idx)
-                im_out = model(coords_chunked,learn_indices,t_coords)
+                im_out = model(coords_chunked,learn_indices,t_coords)#, toy visualization ,gt_data=imten
                 im_out = im_out.permute(0, 3, 2, 1).reshape(1,config.out_features,config.ksize[0],config.ksize[1],-1)
+                im_out = im_out#*window_weights
                 im_out = im_out.reshape(1,config.out_features*config.ksize[0]*config.ksize[1],-1)
                 im_estim = fold(im_out).reshape(-1, config.out_features, H, W) 
                 with torch.no_grad():
                     error_test.append(((imten-im_estim)**2).detach().cpu())
                     rec_test.append(im_estim.detach().cpu())
                     mssim_list.append(msssim_fn_batch([im_estim], imten))
-                
 
-            #print(time_list)
+
             best_img =  torch.cat(rec_test,dim=0).permute(0, 2, 3, 1).numpy()
-            pred_videos.append(best_img)
             if not config.slowmo:
                 mse_list_test = (torch.cat(error_test,dim=0)).mean([1, 2, 3])
                 mse_list_test = tuple(mse_list_test.numpy().tolist())
                 mssim_mean = torch.cat(mssim_list,dim=0).mean()
                 psnr_array_test = -10*np.log10(np.array(mse_list_test))
                 avg_test_psnr = np.average(psnr_array_test)
-                print('Test psnr: {:.3f}'.format(avg_test_psnr))
+                print('test psnr: {:.3f}'.format(avg_test_psnr))
                 with open("{}/rank0.txt".format(save_path),"a") as f:
                     f.write("Average Test PSNR : {:.4f} \n".format(avg_test_psnr))
                     f.write("Average Test SSIM : {:.4f} \n".format(mssim_mean))
                     if not config.inference:
                         f.write("Average Train PNSR: {:.4f} \n".format(avg_psnr))
+
 
         if not config.inference:       
             psnr_array_train = avg_psnr
@@ -326,7 +310,7 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
                 'nparams_array': nparams_array}
     
 
-        return pred_videos[0], info, model
+        return best_img, info, model
     else:
         return None, None, None
     

@@ -16,14 +16,14 @@ import math
 import numpy as np
 from scipy import io
 from skimage.metrics import structural_similarity as ssim_func
-from distr_sampler import MyDistributedSampler
+# from distr_sampler import MyDistributedSampler
 from pytorch_msssim import ms_ssim
 import cv2
 import torch
 import torch.nn.utils.prune as prune
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.nn import Parameter
-from dataset_class import VideoDataset, BalancedSampler, DistributedSamplerWrapper
+from modules.dataset_class import VideoDataset, BalancedSampler, DistributedSamplerWrapper
 import folding_utils as unfoldNd
 import torch.nn.functional as F
 from dahuffman import HuffmanCodec
@@ -46,7 +46,7 @@ losses = importlib.reload(losses)
 volutils = importlib.reload(volutils)
 wire = importlib.reload(wire)
 models = importlib.reload(models)
-#from distr_sampler import MyDistributedSampler
+## from distr_sampler import MyDistributedSampler
 from torch.utils.data.distributed import DistributedSampler
 
 

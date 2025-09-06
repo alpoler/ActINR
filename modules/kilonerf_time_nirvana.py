@@ -14,20 +14,19 @@ import argparse
 import ast
 import math
 import numpy as np
-import torchac
 from scipy import io
 from skimage.metrics import structural_similarity as ssim_func
-from distr_sampler import MyDistributedSampler
+# from distr_sampler import MyDistributedSampler
 from pytorch_msssim import ms_ssim
 import cv2
 import torch
 import torch.nn.utils.prune as prune
 from torch.optim.lr_scheduler import ExponentialLR
 from torch.nn import Parameter
-from dataset_class import VideoDataset, BalancedSampler, DistributedSamplerWrapper
+from modules.dataset_class import VideoDataset, BalancedSampler, DistributedSamplerWrapper
 import folding_utils as unfoldNd
 import torch.nn.functional as F
-from dahuffman import HuffmanCodec
+# from dahuffman import HuffmanCodec
 
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
@@ -47,7 +46,7 @@ losses = importlib.reload(losses)
 volutils = importlib.reload(volutils)
 wire = importlib.reload(wire)
 models = importlib.reload(models)
-#from distr_sampler import MyDistributedSampler
+# from distr_sampler import MyDistributedSampler
 from torch.utils.data.distributed import DistributedSampler
 
 
@@ -145,34 +144,13 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
 
     H = test_dataset.h_max+1
     W = test_dataset.w_max+1
-    # H=1
-    # test_dataset.h_max =1 
-    # test_dataset.w_max = 300
-    # W=300
-    # nchunks=1
+
     nchunks= test_dataset.nchunks
-
-    # if config.resize != -1:
-    #     H,W = config.resize
-    # else:
-        
-    #     H,W = 1080,1920
-    #     #H,W = 480,480
-    # Create folders and unfolders
-
-
 
     
     fold = torch.nn.Fold(output_size=(H, W),
                          kernel_size=config.ksize,
                          stride=config.stride)
-    
-    #window_weights = get_bilinear(H,W,config.ksize,config.stride)
-    #window_weights = window_weights.cuda(rank)
-    
-
-
-
 
     config.no_tiles = test_dataset.no_tiles
     print(config.no_tiles)
@@ -200,41 +178,31 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
                 new_state_dict = {key.replace("module.",""): value for key, value in pretrained_models[idx].items()}
                 pretrained_models[idx].clear()
                 pretrained_models[idx].update(new_state_dict)
-            else:
-                new_state_dict = {"module." + key: value for key, value in pretrained_models[idx].items()}
-                pretrained_models[idx].clear()
-                pretrained_models[idx].update(new_state_dict)
-
             model.load_state_dict(pretrained_models[idx])
             
         model_list.append(model)
-    
-    #hyper_parameters = [param for name, param in model.named_parameters() if 'hyper' in name]
-    #other_parameters = [param for name, param in model.named_parameters() if 'hyper' not in name]
-    #train_dataset.edge_init(model)
-    #from optimizer import Adan
-    #optim = Adan(params=params,lr=config.lr)
-    # optim = torch.optim.Adam([
-    # {'params': hyper_parameters, 'lr': 1e-3},  # Learning rate for 'hyper' parameters
-    # {'params': other_parameters, 'lr': 5e-3}])   # Learning rate for other parameters
 
-    optim = torch.optim.Adam(lr=config.lr, params=params)
+
+    param_groups=[]
+    for name,params in model.named_parameters():
+        if name.endswith("weight"):
+            param_groups+=[{"params": [params],"lr": config.lr,"name":name}]
+        elif name.endswith("scale"):
+            param_groups+=[{"params": [params],"lr": config.lr,"name":name}]
+        elif name.endswith("shift"):
+            param_groups+=[{"params": [params],"lr": config.lr,"name":name}]
+        
+    param_groups += [{"params": [p for n,p in model.named_parameters() if n.endswith("bias")],
+                     "lr": config.lr,"name": "biases"}]
+    optim = torch.optim.Adam(param_groups)
+    prob_models=[{"params": [p for n,p in model.named_parameters() if "cdf" in n],"lr": config.prob_lr,"name": "prob_params"}]
+    prob_optim = torch.optim.Adam(prob_models)
+    
         
     # Criteria
     criterion = losses.L2Norm()
 
-    #prune parameters
-    if config.prune:
-        param_list = []
-        for k,v in model.named_modules():
-            if hasattr(v,"weight"):
-                param_list.append(v)
-        param_to_prune = [(ele,"weight") for ele in param_list]
-        prune_base_ratio = config.prune_ratio
-        prune_num = 0
-    
 
-    
     # Create inputs
     coords_chunked = utils.get_coords((H,W),
                                      config.ksize,
@@ -251,38 +219,30 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
     learn_indices = torch.arange(nchunks).cuda(rank)
     total_params = sum([p.data.nelement() for p in model.parameters()]) / 1e6
     tbar = tqdm.tqdm(range(config.epochs),disable = not master)
-    model_list, quant_ckt = quant_model(model,config)
-    prev_quant= copy.deepcopy(quant_ckt)
+
     if not config.inference:
 
         for idx in tbar:
-            if config.prune and idx==0:
-                prune_num += 1 
-                prune.global_unstructured(
-                    param_to_prune,
-                    pruning_method=prune.L1Unstructured,
-                    amount=1 - prune_base_ratio ** prune_num,
-                )
-                sparisity_num = 0.
-                for param in param_list:
-                    sparisity_num += (param.weight == 0).sum()
-                print(f'Model sparsity at Epoch{idx}: {sparisity_num / 1e6 / total_params}')
             lr = config.lr*pow(0.1, idx/config.epochs)
             optim.param_groups[0]['lr'] = lr
             train_sampler.set_epoch(idx)
             psnr_list = []
-            idx_list = []
-            idx_list1= []
-            #indices_t = torch.randperm(nimg)
+
+
+                        
+            if idx % 10 == 0:
+                model.module.set_divider()
+            
             for sample in train_loader: 
                 t_coords = sample["t"].cuda(rank).permute(1,0,2)
                 imten = sample["img"].cuda(rank)
                 model_idx = sample["model_idx"].cuda(rank)
                 t_coords = (t_coords,model_idx)
-
-                optim.zero_grad()
                 
+                optim.zero_grad()
+                prob_optim.zero_grad()
 
+                entr_loss, bits = model.module.calculate_bit_per_parameter()
                 im_out = model(coords_chunked, learn_indices,t_coords,epochs=idx)
                 im_out = im_out.permute(0, 3, 2, 1).reshape(-1,config.out_features,config.ksize[0],config.ksize[1],nchunks)
                 #im_out = im_out#*window_weights
@@ -293,20 +253,23 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
                     im_estim = fold(im_out).reshape(1, -1, H, W)
                     loss = criterion(im_estim, imten[0,...])
                 else:
-                    loss=criterion(im_estim, imten)#*grad_map[:,None,...]
+                    loss=criterion(im_estim, imten)
+                    total_loss = loss + config.lambda_rate*entr_loss
                 
 
 
-                loss.backward()
+                total_loss.backward()
                 optim.step()
+                prob_optim.step()
                 with torch.no_grad():
+                    bpp = bits / (H*W*config.n_frames)
                     lossval = loss.item()
                     psnr_list.append(-10*math.log10(lossval))
 
                 
             avg_psnr = sum(psnr_list) / len(psnr_list)
             if rank == 0:
-                tbar.set_description(('%.3f')%(avg_psnr))
+                tbar.set_description(('%.3f %.3f')%(avg_psnr,bpp))
                 tbar.refresh()
     
 
@@ -314,65 +277,44 @@ def multibias(rank, stopping_mse, config, pretrained_models=None,world_size=None
 
         # Test for intermediate coordinates 
         pred_videos = []
-        if config.prune:
-            if config.inference:
-                prune_num=0
-                prune.global_unstructured(
-                param_to_prune,
-                pruning_method=prune.L1Unstructured,
-                amount=1 - prune_base_ratio ** prune_num)
-            
-            for param in param_to_prune:
-                prune.remove(param[0], param[1])
-            sparisity_num = 0.
-            for param in param_list:
-                sparisity_num += (param.weight == 0).sum()
-            print(f'Model sparsity at Epoch{0}: {sparisity_num / 1e6 / total_params}\n')
+
         with torch.no_grad():
-            if not config.qat:
-                model_list, quant_ckt = quant_model(model,config)
-            else:
-                model_list = [model]
-            for model_ind, cur_model in enumerate(model_list):
-                error_test = []
-                rec_test = []
-                mssim_list = []
-                for sample in test_loader: 
-                    t_coords = sample["t"].cuda(rank).permute(1,0,2)
-                    imten = sample["img"].cuda(rank)
-                    model_idx = sample["model_idx"].cuda(rank)
-                    t_coords = (t_coords,model_idx)
-                    im_out = cur_model(coords_chunked,learn_indices,t_coords,epochs=10000,gt_data=imten)#, toy visualization 
-                    im_out = im_out.permute(0, 3, 2, 1).reshape(1,config.out_features,config.ksize[0],config.ksize[1],-1)
-                    im_out = im_out#*window_weights
-                    im_out = im_out.reshape(1,config.out_features*config.ksize[0]*config.ksize[1],-1)
-                    im_estim = fold(im_out).reshape(-1, config.out_features, H, W) 
-                    with torch.no_grad():
-                        error_test.append(((imten-im_estim)**2).detach().cpu())
-                        rec_test.append(im_estim.detach().cpu())
-                        mssim_list.append(msssim_fn_batch([im_estim], imten))
 
+            error_test = []
+            rec_test = []
+            mssim_list = []
+            time_list= []
+            for sample in test_loader: 
+                t_coords = sample["t"].cuda(rank).permute(1,0,2)
+                imten = sample["img"].cuda(rank)
+                model_idx = sample["model_idx"].cuda(rank)
+                t_coords = (t_coords,model_idx)
+                im_out = model(coords_chunked,learn_indices,t_coords)
+                im_out = im_out.permute(0, 3, 2, 1).reshape(1,config.out_features,config.ksize[0],config.ksize[1],-1)
+                im_out = im_out.reshape(1,config.out_features*config.ksize[0]*config.ksize[1],-1)
+                im_estim = fold(im_out).reshape(-1, config.out_features, H, W) 
+                with torch.no_grad():
+                    error_test.append(((imten-im_estim)**2).detach().cpu())
+                    rec_test.append(im_estim.detach().cpu())
+                    mssim_list.append(msssim_fn_batch([im_estim], imten))
+                
 
-                best_img =  torch.cat(rec_test,dim=0).permute(0, 2, 3, 1).numpy()
-                pred_videos.append(best_img)
-                if not config.slowmo:
-                    mse_list_test = (torch.cat(error_test,dim=0)).mean([1, 2, 3])
-                    mse_list_test = tuple(mse_list_test.numpy().tolist())
-                    mssim_mean = torch.cat(mssim_list,dim=0).mean()
-                    psnr_array_test = -10*np.log10(np.array(mse_list_test))
-                    avg_test_psnr = np.average(psnr_array_test)
-                    quant_str = "quantized" if model_ind else "non-quantized"
-                    print('{} test psnr: {:.3f}'.format(quant_str,avg_test_psnr))
-                    with open("{}/rank0.txt".format(save_path),"a") as f:
-                        f.write("{} Average Test PSNR : {:.4f} \n".format(quant_str,avg_test_psnr))
-                        f.write("{} Average Test SSIM : {:.4f} \n".format(quant_str,mssim_mean))
-                        if not config.inference:
-                            f.write("Average Train PNSR: {:.4f} \n".format(avg_psnr))
-            ac_bytes_diff_emp,byte_stream_diff_emp = compute_ac_bytes(prev_quant,quant_ckt,True,False,False)
-            bpp = ac_bytes_diff_emp/8000
-            with open("{}/rank0.txt".format(save_path),"a") as f:
-                 f.write(f'After quantization and encoding: \n bits per parameter: bits per pixel: {round(bpp, 4)}')
-            print(f'After quantization and encoding: \n bits per parameter: bits per pixel: {round(bpp, 4)}')
+            #print(time_list)
+            best_img =  torch.cat(rec_test,dim=0).permute(0, 2, 3, 1).numpy()
+            pred_videos.append(best_img)
+            if not config.slowmo:
+                mse_list_test = (torch.cat(error_test,dim=0)).mean([1, 2, 3])
+                mse_list_test = tuple(mse_list_test.numpy().tolist())
+                mssim_mean = torch.cat(mssim_list,dim=0).mean()
+                psnr_array_test = -10*np.log10(np.array(mse_list_test))
+                avg_test_psnr = np.average(psnr_array_test)
+                print('Test psnr: {:.3f}'.format(avg_test_psnr))
+                with open("{}/rank0.txt".format(save_path),"a") as f:
+                    f.write("Average Test PSNR : {:.4f} \n".format(avg_test_psnr))
+                    f.write("Average Test SSIM : {:.4f} \n".format(mssim_mean))
+                    if not config.inference:
+                        f.write("Average Train PNSR: {:.4f} \n".format(avg_psnr))
+
         if not config.inference:       
             psnr_array_train = avg_psnr
             print('train psnr: {:.3f}'.format(psnr_array_train))
@@ -495,26 +437,3 @@ def get_bilinear(H,W,ksize,stride):
     return windows
 
 
-
-def compute_ac_bytes(prev_best,weights, use_diff_ac, use_prob_model, fit_linear):
-    ac_bytes = 0
-    overhead = []
-    with torch.no_grad():
-        for group_name in weights:
-            weight = torch.round(weights[group_name]["quant"])
-            weight = weight - torch.round(prev_best[group_name]["quant"])        
-            weight_pos = weight - torch.min(weight)
-            unique_vals, counts = torch.unique(weight, return_counts = True)
-            cdf = torch.cumsum(counts/counts.sum(),dim=0).detach().cpu()
-            cdf = torch.cat((torch.Tensor([0.0]),cdf))
-            cdf = cdf/cdf[-1]
-            cdf = cdf.unsqueeze(0).repeat(weight.size(0),1)
-            weight_pos = weight_pos.long()
-            unique_vals = torch.unique(weight_pos)
-            mapping = torch.zeros((weight_pos.max().item()+1))
-            mapping[unique_vals] = torch.arange(unique_vals.size(0)).to(mapping)
-            weight_pos = mapping[weight_pos.cpu()]
-            byte_stream = torchac.encode_float_cdf(cdf.clamp(min=0.0,max=1.0).detach().cpu(), weight_pos.detach().cpu().to(torch.int16), \
-                                            check_input_bounds=True)
-            ac_bytes += len(byte_stream)
-    return ac_bytes+sum([torch.finfo(t.dtype).bits/8*t.numel() for t in overhead]),byte_stream
